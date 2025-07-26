@@ -1,12 +1,12 @@
 [project]
 name = "eta"
-version = "0.1.0"
+version = "0.1.1"
 description = "Add your description here"
 readme = "README.md"
 authors = [
     { name = "nguynking", email = "kingnguyen0123@gmail.com" }
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "duckdb>=1.3.2",
     "modal>=1.1.0",
@@ -21,3 +21,8 @@ eta = "eta:main"
 [build-system]
 requires = ["uv_build>=0.8.3,<0.9.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=6.30.0",
+]
