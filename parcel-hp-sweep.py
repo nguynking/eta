@@ -3,9 +3,8 @@ import duckdb
 import numpy as np
 from dataclasses import dataclass
 from datetime import datetime
-from itertools import product
 from pathlib import PosixPath
-from typing import Tuple, List
+from typing import Tuple
 
 import modal
 import torch
@@ -17,7 +16,7 @@ from torch_frame.nn.encoder import EmbeddingEncoder, LinearEncoder
 from torch_frame.nn.models import FTTransformer
 from torchmetrics import Accuracy, MeanAbsoluteError
 
-# ──────────────────────────────────────────────────────────────────── Modal app
+# Modal app
 app        = modal.App("parcel-hp-sweep")
 MINUTES     = 60
 HOURS       = 60 * MINUTES
@@ -26,7 +25,7 @@ vol         = modal.Volume.from_name("parcel")
 VPATH       = PosixPath("/vol")
 MODEL_DIR   = VPATH / "models"
 
-# ─────────────────────────────────────────────────────────── container images
+# container images
 base_image  = (
     modal.Image.debian_slim(python_version="3.12")
     .uv_pip_install(
@@ -43,11 +42,9 @@ torch_image = (
         "wandb",
         "tensorboard"
     )
-    # .run_commands("pip uninstall opencv-python -y")
-    # .uv_pip_install("opencv-python-headless")
 )
 
-# ──────────────────────────────────────────────────────────────── helpers
+# helpers
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -60,6 +57,11 @@ class HParams:
     # model
     channels: int        = 32
     n_layers: int        = 10
+    num_heads: int       = 8
+    encoder_pad_size = 2
+    attn_dropout = 0.3
+    ffn_dropout = 0.3
+    gamma: float = 0.95
     # optimisation
     lr: float            = 1e-2
     # dataset
@@ -68,7 +70,7 @@ class HParams:
     val_split: float     = 0.2
     seed: int            = 42
 
-# ─────────────────────────────────────────────────────────────── data module
+# data module
 def build_dataloaders(
     parquet_path: str,
     target_col: str,
@@ -106,18 +108,14 @@ def build_dataloaders(
 
     train_ds.materialize(path=VPATH / "train_stats.pt")
     val_ds.materialize(path=VPATH / "val_stats.pt", col_stats=train_ds.col_stats)
-    # n_train = int(len(full_ds) * (1 - h.val_split))
-    # train_ds, val_ds = full_ds[:n_train], full_ds[n_train:]
-
-    # train_ds.materialize(path=VPATH / "train_stats.pt")
-    # val_ds.materialize(path=VPATH / "val_stats.pt", col_stats=train_ds.col_stats)
 
     train_loader = DataLoader(train_ds, batch_size=h.batch_size, shuffle=True)
     val_loader   = DataLoader(val_ds, batch_size=h.batch_size)
 
     return train_loader, val_loader, train_ds.col_stats, train_ds.tensor_frame.col_names_dict
 
-# ───────────────────────────────────────────────────────────── training loop
+
+# training loop
 def run_epoch(
     model, loader, optim, criterion, device
 ) -> float:
@@ -146,7 +144,70 @@ def evaluate(model, loader, metric, device) -> float:
         metric.update(pred, batch.y.float())
     return metric.compute().item()
 
-# ──────────────────────────────────────────────────────────────── remote fn
+
+def build_model(model_name: str,
+                h: HParams,
+                col_stats,
+                col_names_dict,
+                device) -> torch.nn.Module:
+    enc = {
+        tf.stype.categorical: EmbeddingEncoder(),
+        tf.stype.numerical:   LinearEncoder(),
+    }
+
+    if model_name == "ftt":
+        return FTTransformer(
+            channels=h.channels,
+            num_layers=h.n_layers,
+            out_channels=1,
+            col_stats=col_stats,
+            col_names_dict=col_names_dict,
+            stype_encoder_dict=enc,
+        ).to(device)
+
+    elif model_name == "mlp":
+        from torch_frame.nn.models import MLP
+        return MLP(
+            num_layers=h.n_layers,
+            channels=h.channels,
+            out_channels=1,
+            col_stats=col_stats,
+            col_names_dict=col_names_dict,
+            stype_encoder_dict=enc,
+        ).to(device)
+
+    elif model_name == "tab_transformer":
+        from torch_frame.nn.models import TabTransformer
+        return TabTransformer(
+            num_layers=h.n_layers,
+            num_heads=h.num_heads,
+            encoder_pad_size=h.encoder_pad_size,
+            attn_dropout=h.attn_dropout,
+            ffn_dropout=h.ffn_dropout,
+            channels=h.channels,
+            out_channels=1,
+            col_stats=col_stats,
+            col_names_dict=col_names_dict
+        ).to(device)
+
+    elif model_name == "tabnet":
+        from torch_frame.nn.models import TabNet
+        # TabNet expects **arrays**, so we wrap it with a tiny adapter
+        return TabNet(
+            out_channels=1,
+            num_layers=h.n_layers,
+            split_attn_channels=h.channels,
+            split_feat_channels=h.channels,
+            gamma=h.gamma,
+            col_stats=col_stats,
+            col_names_dict=col_names_dict,
+        ).to(device)
+
+    else:
+        raise ValueError(f"Unknown model '{model_name}'")
+
+
+# remote fn
 @app.function(
     gpu=GPU_TYPE,
     image=torch_image,
@@ -179,32 +240,23 @@ def train_model(
         tf.stype.categorical: EmbeddingEncoder(),
         tf.stype.numerical:   LinearEncoder(),
     }
-    model = FTTransformer(
-        channels=h.channels,
-        num_layers=h.n_layers,
-        out_channels=1,
-        col_stats=col_stats,
-        col_names_dict=col_names_dict,
-        stype_encoder_dict=enc,
-    )
-    if torch.cuda.device_count() > 1:
-        model = torch.nn.DataParallel(model)
-    model.to(device)
+
+    model = build_model("mlp", h, col_stats, col_names_dict, device=device)
+    model = torch.compile(model, dynamic=True)
+
+    # use data parellel for faster training
+    # if torch.cuda.device_count() > 1:
+    #     model = torch.nn.DataParallel(model)
 
     # ---- optimisation
     optim = torch.optim.AdamW(model.parameters(), lr=h.lr)
 
-    # ── learning‑rate schedule (cosine with warm restarts) ──
-    # ‣ starts at h.lr, anneals to ~0, then restarts every T_0 epochs
-    #   (T_0=10, T_mult=2 → restarts at 10, 30, 70, …)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optim, T_0=10, T_mult=2
-    )
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optim, gamma=h.gamma)
 
     criterion = torch.nn.SmoothL1Loss() if task == "regression" else torch.nn.BCEWithLogitsLoss()
     metric    = MeanAbsoluteError().to(device) if task == "regression" else Accuracy(task="binary").to(device)
 
-    # ---- W&B
+    # W&B
     import wandb
     wandb.init(
         project="parcel-tabular",
@@ -216,9 +268,6 @@ def train_model(
     for epoch in range(1, max_epochs + 1):
         tr_loss = run_epoch(model, train_loader, optim, criterion, device)
 
-        # ── learning‑rate schedule (cosine with warm restarts) ──
-        # ‣ starts at h.lr, anneals to ~0, then restarts every T_0 epochs
-        #   (T_0=10, T_mult=2 → restarts at 10, 30, 70, …)
         # update LR after each epoch
         scheduler.step()
         # handy for W&B graphs
@@ -246,7 +295,7 @@ def train_model(
     wandb.finish()
     return float(best_val)
 
-# ──────────────────────────────────────────────────────────────── sweep main
+# sweep main
 @app.local_entrypoint()
 def main(
     parquet_path: str = "parcel_data.parquet",
