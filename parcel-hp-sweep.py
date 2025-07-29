@@ -20,7 +20,7 @@ from torchmetrics import Accuracy, MeanAbsoluteError
 app        = modal.App("parcel-hp-sweep")
 MINUTES     = 60
 HOURS       = 60 * MINUTES
-GPU_TYPE    = "T4"            # change to H100 / A100 etc. if you like
+GPU_TYPE    = "T4"
 vol         = modal.Volume.from_name("parcel")
 VPATH       = PosixPath("/vol")
 MODEL_DIR   = VPATH / "models"
@@ -91,14 +91,14 @@ def build_dataloaders(
     else:
         df[target_col] = df[target_col].astype(int)
 
-    # simple heuristic – drop obvious identifiers
+    # drop obvious identifiers
     df = df.drop(columns=[c for c in df.columns if c.endswith("_id")], errors="ignore")
 
     col2stype = infer_df_stype(df)
     col2stype[target_col] = tf.numerical if task == "regression" else tf.categorical
 
     full_ds = Dataset(df, col_to_stype=col2stype, target_col=target_col)
-    full_ds.materialize(path=VPATH / "full_stats.pt")   # now TensorFrame exists
+    full_ds.materialize(path=VPATH / "full_stats.pt")
     num_rows = full_ds.num_rows
     n_train  = int(num_rows * (1 - h.val_split))
     g        = torch.Generator().manual_seed(h.seed)
@@ -192,7 +192,7 @@ def build_model(model_name: str,
 
     elif model_name == "tabnet":
         from torch_frame.nn.models import TabNet
-        # TabNet expects **arrays**, so we wrap it with a tiny adapter
+        # TabNet expects arrays, so we wrap it with a tiny adapter
         return TabNet(
             out_channels=1,
             num_layers=h.n_layers,
@@ -230,12 +230,12 @@ def train_model(
     set_seed(h.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # ---- data
+    # data
     train_loader, val_loader, col_stats, col_names_dict = build_dataloaders(
         parquet_path, target_col, task, h
     )
 
-    # ---- model
+    # model
     enc = {
         tf.stype.categorical: EmbeddingEncoder(),
         tf.stype.numerical:   LinearEncoder(),
@@ -248,7 +248,7 @@ def train_model(
     # if torch.cuda.device_count() > 1:
     #     model = torch.nn.DataParallel(model)
 
-    # ---- optimisation
+    # optimisation
     optim = torch.optim.AdamW(model.parameters(), lr=h.lr)
 
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optim, gamma=h.gamma)
