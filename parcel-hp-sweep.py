@@ -1,6 +1,7 @@
 import random
 import duckdb
 import numpy as np
+import pandas as pd
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import PosixPath
@@ -55,25 +56,24 @@ def set_seed(seed: int):
 @dataclass
 class HParams:
     # model
-    channels: int        = 32
-    n_layers: int        = 10
-    num_heads: int       = 8
-    encoder_pad_size = 2
-    attn_dropout = 0.3
-    ffn_dropout = 0.3
+    channels: int = 32
+    n_layers: int = 10
+    num_heads: int = 8
+    encoder_pad_size: int = 2
+    attn_dropout: float = 0.3
+    ffn_dropout: float = 0.3
     gamma: float = 0.95
     # optimisation
-    lr: float            = 1e-2
+    lr: float = 1e-2
     # dataset
-    sample_rows: int     = 10
-    batch_size: int      = 2
-    val_split: float     = 0.2
-    seed: int            = 42
+    sample_rows: int = 10
+    batch_size: int = 2
+    val_split: float = 0.2
+    seed: int = 42
 
 # data module
 def build_dataloaders(
     parquet_path: str,
-    target_col: str,
     task: str,
     h: HParams,
 ) -> Tuple[DataLoader, DataLoader, tf.data.Dataset.col_stats, dict]:
@@ -81,18 +81,69 @@ def build_dataloaders(
     Returns train & val DataLoaders plus col_stats / col_names_dict needed by model.
     `task` ∈ {"regression", "binary"}
     """
+    if task not in {"regression", "binary"}:
+        raise ValueError(f"task must be 'regression' or 'binary', got {task!r}")
+
+    if task == "binary":
+        target_col = "is_successful_delivery"
+    else:
+        target_col = "total_hours_from_receiving_to_last_delivery"
+
     q = f"""SELECT * FROM '{VPATH / parquet_path}'"""
     if h.sample_rows:
         q += f""" USING SAMPLE reservoir({h.sample_rows} ROWS) REPEATABLE ({h.seed})"""
+
     df = duckdb.sql(q).df()
+
+    # # --- Build a canonical target column: df['y'] ---
+    # if task == "binary":
+    #     if "is_successful_delivery" not in df.columns:
+    #         raise KeyError("Expected column 'is_successful_delivery' for binary task.")
+    #     # Coerce to integers first
+    #     y = df["is_successful_delivery"]
+    #     # If upstream is dirty (e.g., durations leaked in), binarize by a rule YOU control.
+    #     # Example rule: treat any positive value as success (adjust to your business logic).
+    #     if not set(pd.unique(y.dropna())).issubset({0, 1}):
+    #         y = (pd.to_numeric(y, errors="coerce").fillna(0) > 0).astype("int8")
+    #     else:
+    #         y = y.astype("int8")
+    #     df = df.assign(y=y)
+    #     target_col = "y"
+
+    #     # Drop duration column to prevent accidental target pickup:
+    #     if "total_hours_from_receiving_to_last_delivery" in df.columns:
+    #         df = df.drop(columns=["total_hours_from_receiving_to_last_delivery"])
+
+    #     # Validate label invariants
+    #     bad = ~df["y"].isin([0, 1])
+    #     if bad.any():
+    #         # Surface a tiny sample to logs if it ever happens
+    #         samples = df.loc[bad, ["y"]].head(5).to_dict(orient="records")
+    #         raise RuntimeError(f"Binary target contains non-binary values. Samples: {samples}")
+
+    # else:  # regression
+    #     if "total_hours_from_receiving_to_last_delivery" not in df.columns:
+    #         raise KeyError("Expected column 'total_hours_from_receiving_to_last_delivery' for regression task.")
+    #     df = df.assign(
+    #         y=pd.to_numeric(df["total_hours_from_receiving_to_last_delivery"], errors="coerce").astype("float32")
+    #     )
+    #     target_col = "y"
+    df = df.drop(columns=[
+        "customer_id",
+        "last_delivery_datetime_hour",
+        "last_delivery_datetime_day",
+        "last_delivery_datetime_month",
+        "last_delivery_datetime_is_non_working_day",
+        "parcel_id",
+        "is_successful_delivery_at_first_time",
+        "total_hours_from_receiving_to_last_failed_delivery",
+        "total_hours_from_receiving_to_last_success_delivery"
+    ])
 
     if task == "regression":
         df[target_col] = df[target_col].astype(float)
     else:
         df[target_col] = df[target_col].astype(int)
-
-    # drop obvious identifiers
-    df = df.drop(columns=[c for c in df.columns if c.endswith("_id")], errors="ignore")
 
     col2stype = infer_df_stype(df)
     col2stype[target_col] = tf.numerical if task == "regression" else tf.categorical
@@ -137,11 +188,16 @@ def evaluate(model, loader, metric, device) -> float:
     metric.reset()
     model.eval()
     for batch in loader:
+        print(f"batch.y: {batch.y}")
         batch = batch.to(device)
         pred  = model(batch).squeeze()
         if isinstance(metric, Accuracy):
+            # Turn logits → probabilities and pass integer targets
             pred = torch.sigmoid(pred)
-        metric.update(pred, batch.y.float())
+            print(f"batch.y: {batch.y}")
+            metric.update(pred, batch.y.int())
+        else:
+            metric.update(pred, batch.y.float())
     return metric.compute().item()
 
 
@@ -218,7 +274,6 @@ def build_model(model_name: str,
 )
 def train_model(
     parquet_path: str,
-    target_col: str,
     task: str,
     h: HParams,
     run_to_end: bool,
@@ -232,7 +287,7 @@ def train_model(
 
     # data
     train_loader, val_loader, col_stats, col_names_dict = build_dataloaders(
-        parquet_path, target_col, task, h
+        parquet_path, task, h
     )
 
     # model
@@ -299,7 +354,6 @@ def train_model(
 @app.local_entrypoint()
 def main(
     parquet_path: str = "parcel_data.parquet",
-    target_col: str   = "total_hours_from_receiving_to_last_success_delivery",
     task: str         = "regression",
 ):
     """
@@ -342,7 +396,7 @@ def main(
     hp = HParams()
     print(f"Launching {len([hp])} hyper-param jobs on Modal …")
     print(hp)
-    best_val = train_model.remote(parquet_path, target_col, task, hp, True, max_epochs=200)
+    best_val = train_model.remote(parquet_path, "binary", hp, True, max_epochs=200)
     best_h = hp
 
     print(f"\nBest so far: {best_h} ({best_val:.4f}) — continuing to full training …")
